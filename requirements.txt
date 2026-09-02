@@ -1,0 +1,4 @@
+# Official Webull OpenAPI SDK - required (Webull's request signing scheme
+# isn't something this script re-implements by hand).
+# https://github.com/webull-inc/webull-openapi-python-sdk
+webull-openapi-python-sdk>=2.0.0
