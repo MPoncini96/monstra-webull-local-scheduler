@@ -52,10 +52,19 @@ Safety:
     human running this interactively can do -- an unattended scheduled run
     with DRY_RUN=false will just print the plan and log a warning that it
     needs interactive confirmation).
-  - Orders are whole-share MARKET/DAY orders only.
+  - Orders are MARKET/DAY orders that can size to a fractional share count,
+    matching your Monstra target weight instead of rounding down to whole
+    shares. Webull's own API only allows a fractional (<1 share) quantity in
+    a single order, so a trade spanning a whole-share boundary (e.g. 3.457
+    shares) is split into a whole-share order plus a separate fractional
+    order -- see split_into_order_legs() in main.py.
   - Sells are capped at your current share count -- this script never opens
     a short position.
-  - Trades below MIN_TRADE_DOLLARS are skipped to avoid dust orders.
+  - Trades below MIN_TRADE_DOLLARS are skipped to avoid dust orders. A
+    fractional leg is also skipped if it's below Webull's own $5 minimum
+    fractional-order value -- that's a hard Webull API constraint this
+    script cannot route around, so an existing dust-sized fractional
+    remainder can occasionally get stuck (logged clearly when it happens).
 
 This script places real trades with real money once WEBULL_ENV=production,
 DRY_RUN=false, and you confirm. Review the printed plan carefully.
@@ -235,7 +244,21 @@ def get_last_prices(data_client, symbols):
     return prices
 
 
+# Webull's own floor for a fractional (<1 share) order leg -- not a business
+# rule like MIN_TRADE_DOLLARS, just what the API requires (see
+# split_into_order_legs). A leg below this can't be placed at all.
+MIN_WEBULL_FRACTIONAL_DOLLARS = 5.0
+
+
 def build_trade_plan(holdings, total_value, positions, prices):
+    """current_shares and target_shares are kept as floats (never int()'d or
+    floor()'d): truncating either to a whole share used to make the script
+    think it held nothing of a sub-1-share position, and rounded any target
+    weight cheaper than one full share down to zero shares -- sometimes
+    forever. Actually placing a fractional quantity still has to respect
+    Webull's own per-order rules (see split_into_order_legs in place_order),
+    but the plan itself should reflect the real fractional numbers.
+    """
     symbols = set(holdings) | set(positions)
     plan = []
     for symbol in sorted(symbols):
@@ -245,8 +268,8 @@ def build_trade_plan(holdings, total_value, positions, prices):
             continue
 
         target_dollars = holdings.get(symbol, 0.0) * total_value
-        target_shares = math.floor(target_dollars / price)
-        current_shares = int(positions.get(symbol, 0))
+        target_shares = target_dollars / price
+        current_shares = float(positions.get(symbol, 0.0))
         delta_shares = target_shares - current_shares
 
         if delta_shares > 0:
@@ -273,7 +296,25 @@ def build_trade_plan(holdings, total_value, positions, prices):
     return plan
 
 
-def place_order(trade_client, account_id, trade):
+def split_into_order_legs(quantity):
+    """Webull only allows a fractional order quantity strictly between 0 and
+    1 share (MARKET only, min $5 order value - see the Fractional Shares
+    example in Webull's Stock Trading API docs), so a quantity that spans a
+    whole-share boundary (e.g. 3.457) has to be split into a whole-share leg
+    and a separate sub-1-share fractional leg; Webull's API has no way to
+    place both in a single order."""
+    whole = math.floor(quantity + 1e-9)
+    frac = round(quantity - whole, 6)
+    legs = []
+    if whole > 0:
+        legs.append(("whole", float(whole)))
+    if frac > 1e-9:
+        legs.append(("fractional", frac))
+    return legs
+
+
+def _submit_order_leg(trade_client, account_id, trade, leg_kind, leg_qty):
+    qty_str = str(int(leg_qty)) if leg_kind == "whole" else f"{leg_qty:.6f}".rstrip("0").rstrip(".")
     order = {
         "combo_type": "NORMAL",
         "client_order_id": uuid.uuid4().hex,
@@ -285,13 +326,33 @@ def place_order(trade_client, account_id, trade):
         "support_trading_session": "CORE",
         "time_in_force": "DAY",
         "side": trade["side"],
-        "quantity": str(trade["quantity"]),
+        "quantity": qty_str,
     }
     res = trade_client.order_v3.place_order(account_id, [order])
     if res.status_code != 200:
-        log.error("  FAILED %s %s %s: (%s) %s", trade["side"], trade["quantity"], trade["symbol"], res.status_code, res.text)
+        log.error(
+            "  FAILED %s %s %s (%s leg): (%s) %s",
+            trade["side"], qty_str, trade["symbol"], leg_kind, res.status_code, res.text,
+        )
     else:
-        log.info("  submitted %s %s %s", trade["side"], trade["quantity"], trade["symbol"])
+        log.info("  submitted %s %s %s (%s leg)", trade["side"], qty_str, trade["symbol"], leg_kind)
+
+
+def place_order(trade_client, account_id, trade):
+    for leg_kind, leg_qty in split_into_order_legs(trade["quantity"]):
+        if leg_kind == "fractional" and leg_qty * trade["price"] < MIN_WEBULL_FRACTIONAL_DOLLARS:
+            # A real Webull API constraint, not something this script can
+            # route around: a sub-1-share order below $5 can't be placed at
+            # all, so a dust-sized fractional remainder can get stuck here in
+            # a way it wouldn't on Alpaca (which allows an exact-quantity
+            # full-liquidation sell with no dollar minimum).
+            log.warning(
+                "  skipping %s %.6f sh fractional remainder of %s: $%.2f order value is below "
+                "Webull's $%.2f fractional-order minimum",
+                trade["side"], leg_qty, trade["symbol"], leg_qty * trade["price"], MIN_WEBULL_FRACTIONAL_DOLLARS,
+            )
+            continue
+        _submit_order_leg(trade_client, account_id, trade, leg_kind, leg_qty)
 
 
 # ------------------------------------------------------------------
@@ -323,7 +384,7 @@ def main():
     log.info("Proposed trades:")
     for trade in plan:
         log.info(
-            "  %-4s %6d %-8s @ ~$%.2f  (%s -> %s shares)",
+            "  %-4s %10.6f %-8s @ ~$%.2f  (%.6f -> %.6f shares)",
             trade["side"],
             trade["quantity"],
             trade["symbol"],

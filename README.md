@@ -155,10 +155,17 @@ so export the variables in the line itself or a wrapper script:
   unless you explicitly set `WEBULL_ENV=production`.
 - `DRY_RUN` defaults to `true`. Even with `DRY_RUN=false`, orders are only
   ever submitted from an interactive run where you type `EXECUTE`.
-- Orders are whole-share MARKET/DAY orders only.
+- Orders are MARKET/DAY orders that can size to a fractional share count, so
+  a target weight is matched instead of rounding down to whole shares.
+  Webull only allows a fractional (<1 share) quantity in a single order, so
+  a trade spanning a whole-share boundary is split into a whole-share order
+  plus a separate fractional order.
 - Sells are capped at your current share count — this never opens a short
   position.
-- Trades below `MIN_TRADE_DOLLARS` are skipped.
+- Trades below `MIN_TRADE_DOLLARS` are skipped. A fractional leg is also
+  skipped if it's below Webull's own $5 fractional-order minimum — a
+  platform constraint this script can't work around, so a dust-sized
+  fractional remainder can occasionally get stuck (logged when it happens).
 - **This script places real trades with real money once `WEBULL_ENV=production`,
   `DRY_RUN=false`, and you confirm interactively.** Test thoroughly against
   `WEBULL_ENV=sandbox` first. Review the printed/logged plan carefully.
